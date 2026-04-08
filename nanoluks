@@ -1,0 +1,417 @@
+#!/usr/bin/env bash
+#
+# nanoluks - simple LUKS container manager
+#
+set -euo pipefail
+
+VERSION="0.1.0"
+PROG="nanoluks"
+MAPPER_PREFIX="nanoluks"
+MOUNT_BASE="/mnt/nanoluks"
+
+# Defaults
+DEFAULT_SIZE="2G"
+DEFAULT_FS="ext4"
+SUPPORTED_FS="ext4 xfs btrfs exfat"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+die() { echo "${PROG}: error: $*" >&2; exit 1; }
+info() { echo ":: $*"; }
+warn() { echo "${PROG}: warning: $*" >&2; }
+
+# Read a passphrase from the terminal (no echo), fall back to stdin
+read_passphrase() {
+    local prompt="${1:-Enter passphrase: }" var="$2"
+    if [[ -r /dev/tty ]] && : </dev/tty 2>/dev/null; then
+        read -rsp "$prompt" "${var?}" </dev/tty
+        echo >&2  # newline after hidden input
+    else
+        read -rsp "$prompt" "${var?}"
+        echo >&2
+    fi
+}
+
+# Read and verify a new passphrase (for luksFormat)
+read_new_passphrase() {
+    local pass1 pass2
+    while true; do
+        read_passphrase "Enter passphrase: " pass1
+        read_passphrase "Verify passphrase: " pass2
+        if [[ "$pass1" == "$pass2" ]]; then
+            echo "$pass1"
+            return
+        fi
+        warn "passphrases do not match, try again"
+    done
+}
+
+need_cmd() {
+    command -v "$1" &>/dev/null || die "required command not found: $1"
+}
+
+check_deps() {
+    need_cmd cryptsetup
+    need_cmd losetup
+    need_cmd mount
+    need_cmd umount
+    need_cmd truncate
+    need_cmd bc
+}
+
+# Derive a mapper name from a container path: /foo/bar/vault.img -> nanoluks-vault
+mapper_name_from_path() {
+    local base
+    base="$(basename "$1")"
+    base="${base%%.*}"
+    echo "${MAPPER_PREFIX}-${base}"
+}
+
+# Find the loop device currently backing a container file (empty if none)
+find_loop_for_file() {
+    local abs
+    abs="$(realpath "$1" 2>/dev/null || echo "$1")"
+    losetup -j "$abs" 2>/dev/null | head -n1 | cut -d: -f1
+}
+
+# Check if a mapper name is active
+mapper_is_active() {
+    [[ -e "/dev/mapper/$1" ]]
+}
+
+# Parse a human size string (e.g. 10MB, 2G, 500M) into bytes, aligned to 512
+parse_size() {
+    local input="$1"
+    local num unit
+    num="$(echo "$input" | sed -E 's/^([0-9]+(\.[0-9]+)?).*/\1/')"
+    unit="$(echo "$input" | sed -E 's/^[0-9]+(\.[0-9]+)?//' | tr '[:lower:]' '[:upper:]')"
+
+    [[ -n "$num" ]] || die "invalid size: ${input}"
+
+    local bytes
+    case "$unit" in
+        B|"")   bytes="$num" ;;
+        K|KB)   bytes="$(echo "$num * 1000" | bc)" ;;
+        KIB)    bytes="$(echo "$num * 1024" | bc)" ;;
+        M|MB)   bytes="$(echo "$num * 1000000" | bc)" ;;
+        MIB)    bytes="$(echo "$num * 1048576" | bc)" ;;
+        G|GB)   bytes="$(echo "$num * 1000000000" | bc)" ;;
+        GIB)    bytes="$(echo "$num * 1073741824" | bc)" ;;
+        T|TB)   bytes="$(echo "$num * 1000000000000" | bc)" ;;
+        TIB)    bytes="$(echo "$num * 1099511627776" | bc)" ;;
+        *)      die "unknown size unit: ${unit}" ;;
+    esac
+
+    # Truncate to integer and align up to 512-byte sector boundary
+    bytes="$(echo "$bytes / 1" | bc)"
+    local remainder=$((bytes % 512))
+    if [[ $remainder -ne 0 ]]; then
+        bytes=$((bytes + 512 - remainder))
+    fi
+
+    echo "$bytes"
+}
+
+# Resolve absolute path for a container file
+resolve_path() {
+    realpath -m "$1"
+}
+
+usage() {
+    cat <<EOF
+${PROG} ${VERSION} - simple LUKS container manager
+
+Usage:
+  ${PROG} create <path> [options]    Create a new encrypted container
+  ${PROG} open   <path> [options]    Open and mount an existing container
+  ${PROG} close  <path|mount|name>   Unmount, close, and detach a container
+  ${PROG} status [path]              Show status of containers
+
+Create options:
+  --size <size>     Container size (default: ${DEFAULT_SIZE})
+  --fs <type>       Filesystem: ${SUPPORTED_FS// /, } (default: ${DEFAULT_FS})
+
+Open options:
+  --mount <path>    Custom mount point (default: ${MOUNT_BASE}/<name>)
+
+Examples:
+  ${PROG} create vault.img --size 4G --fs btrfs
+  ${PROG} open vault.img
+  ${PROG} close vault.img
+  ${PROG} status
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_create() {
+    local container="" size="$DEFAULT_SIZE" fs="$DEFAULT_FS"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --size) size="$2"; shift 2 ;;
+            --fs)   fs="$2";   shift 2 ;;
+            -*)     die "unknown option: $1" ;;
+            *)      if [[ -z "$container" ]]; then container="$1"; else die "unexpected argument: $1"; fi; shift ;;
+        esac
+    done
+
+    [[ -n "$container" ]] || die "usage: ${PROG} create <path> [--size SIZE] [--fs TYPE]"
+
+    # Validate filesystem
+    local fs_valid=false
+    for f in $SUPPORTED_FS; do
+        [[ "$f" == "$fs" ]] && fs_valid=true
+    done
+    $fs_valid || die "unsupported filesystem: ${fs} (supported: ${SUPPORTED_FS// /, })"
+
+    # Check mkfs for chosen fs
+    local mkfs_cmd="mkfs.${fs}"
+    [[ "$fs" == "exfat" ]] && mkfs_cmd="mkfs.exfat"
+    need_cmd "$mkfs_cmd"
+
+    container="$(resolve_path "$container")"
+    local mapper
+    mapper="$(mapper_name_from_path "$container")"
+
+    [[ -e "$container" ]] && die "file already exists: ${container}"
+    mapper_is_active "$mapper" && die "mapper ${mapper} already active"
+
+    local size_bytes
+    size_bytes="$(parse_size "$size")"
+
+    # LUKS2 header needs 16 MiB; require 32 MiB minimum for a usable filesystem
+    local min_bytes=$((32 * 1024 * 1024))
+    if [[ "$size_bytes" -lt "$min_bytes" ]]; then
+        die "container too small: ${size} (${size_bytes} bytes). Minimum is 32 MiB (LUKS2 header requires 16 MiB)."
+    fi
+
+    info "Creating ${size} (${size_bytes} bytes) container at ${container}"
+    truncate -s "$size_bytes" "$container"
+
+    info "Attaching loop device"
+    local loop
+    loop="$(sudo losetup -fP --show "$container")"
+    info "Loop device: ${loop}"
+
+    info "Formatting as LUKS"
+    local passphrase
+    passphrase="$(read_new_passphrase)"
+    echo "$passphrase" | sudo cryptsetup luksFormat -q "$loop" --key-file=-
+
+    info "Opening LUKS device as ${mapper}"
+    echo "$passphrase" | sudo cryptsetup open "$loop" "$mapper" --key-file=-
+
+    info "Creating ${fs} filesystem"
+    sudo "$mkfs_cmd" "/dev/mapper/${mapper}"
+
+    info "Closing device"
+    sudo cryptsetup close "$mapper"
+    sudo losetup -d "$loop"
+
+    info "Done. Container ready: ${container}"
+    info "Run '${PROG} open ${container}' to mount it."
+}
+
+cmd_open() {
+    local container="" mountpoint=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --mount) mountpoint="$2"; shift 2 ;;
+            -*)      die "unknown option: $1" ;;
+            *)       if [[ -z "$container" ]]; then container="$1"; else die "unexpected argument: $1"; fi; shift ;;
+        esac
+    done
+
+    [[ -n "$container" ]] || die "usage: ${PROG} open <path> [--mount PATH]"
+
+    container="$(resolve_path "$container")"
+    [[ -f "$container" ]] || die "container not found: ${container}"
+
+    local mapper
+    mapper="$(mapper_name_from_path "$container")"
+    local base_name="${mapper#"${MAPPER_PREFIX}"-}"
+    [[ -z "$mountpoint" ]] && mountpoint="${MOUNT_BASE}/${base_name}"
+
+    mapper_is_active "$mapper" && die "already open: /dev/mapper/${mapper}"
+
+    info "Attaching loop device"
+    local loop
+    loop="$(sudo losetup -fP --show "$container")"
+    info "Loop device: ${loop}"
+
+    info "Opening ${container}"
+    local passphrase
+    read_passphrase "Enter passphrase: " passphrase
+    echo "$passphrase" | sudo cryptsetup open "$loop" "$mapper" --key-file=-
+
+    info "Mounting at ${mountpoint}"
+    sudo mkdir -p "$mountpoint"
+    sudo mount "/dev/mapper/${mapper}" "$mountpoint"
+
+    info "Mounted: ${mountpoint}"
+}
+
+cmd_close() {
+    local target=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -*) die "unknown option: $1" ;;
+            *)  if [[ -z "$target" ]]; then target="$1"; else die "unexpected argument: $1"; fi; shift ;;
+        esac
+    done
+
+    [[ -n "$target" ]] || die "usage: ${PROG} close <path|mountpoint|name>"
+
+    local mapper="" container=""
+
+    # Check if target is a mapper name (e.g. "nanoluks-vault" or "vault")
+    if [[ ! "$target" == */* ]] && ! [[ -e "$target" ]]; then
+        # Bare name - try with and without prefix
+        if mapper_is_active "${MAPPER_PREFIX}-${target}"; then
+            mapper="${MAPPER_PREFIX}-${target}"
+        elif mapper_is_active "$target" && [[ "$target" == ${MAPPER_PREFIX}-* ]]; then
+            mapper="$target"
+        fi
+        if [[ -n "$mapper" ]]; then
+            # Try to find the backing container file via the loop device
+            local loop
+            loop="$(sudo cryptsetup status "$mapper" 2>/dev/null | grep 'device:' | awk '{print $2}' || true)"
+            if [[ -n "$loop" ]]; then
+                container="$(losetup -O BACK-FILE -n "$loop" 2>/dev/null | xargs || true)"
+            fi
+        else
+            die "no active mapper found for: ${target}"
+        fi
+    fi
+
+    if [[ -z "$mapper" ]]; then
+        target="$(resolve_path "$target")"
+    fi
+
+    if [[ -n "$mapper" ]]; then
+        : # Already resolved from name lookup above
+    elif [[ -f "$target" ]]; then
+        # Argument is a container file
+        container="$target"
+        mapper="$(mapper_name_from_path "$container")"
+    elif [[ -d "$target" ]]; then
+        # Argument is a mount point - find which mapper is mounted there
+        local src
+        src="$(findmnt -n -o SOURCE "$target" 2>/dev/null || true)"
+        [[ -n "$src" ]] || die "nothing mounted at: ${target}"
+        [[ "$src" == /dev/mapper/${MAPPER_PREFIX}-* ]] || die "not a ${PROG} mount: ${target} (source: ${src})"
+        mapper="${src##*/}"
+        # Try to find the backing container file via the loop device
+        local loop
+        loop="$(sudo cryptsetup status "$mapper" 2>/dev/null | grep 'device:' | awk '{print $2}' || true)"
+        if [[ -n "$loop" ]]; then
+            container="$(losetup -O BACK-FILE -n "$loop" 2>/dev/null || true)"
+        fi
+    else
+        die "not found: ${target} (expected a container file, mount point, or mapper name)"
+    fi
+
+    if ! mapper_is_active "$mapper"; then
+        die "not open: ${mapper}"
+    fi
+
+    # Find mount point and unmount
+    local mnt
+    mnt="$(findmnt -n -o TARGET "/dev/mapper/${mapper}" 2>/dev/null || true)"
+    if [[ -n "$mnt" ]]; then
+        info "Unmounting ${mnt}"
+        sudo umount "$mnt"
+        # Remove mount directory if it's under our mount base and empty
+        if [[ "$mnt" == "${MOUNT_BASE}/"* ]] && [[ -d "$mnt" ]]; then
+            sudo rmdir "$mnt" 2>/dev/null || true
+        fi
+    fi
+
+    info "Closing LUKS device ${mapper}"
+    sudo cryptsetup close "$mapper"
+
+    # Detach loop device
+    local loop=""
+    if [[ -n "$container" ]]; then
+        loop="$(find_loop_for_file "$container")"
+    fi
+    if [[ -z "$loop" ]]; then
+        # Fallback: get loop from cryptsetup status (already closed, so check losetup directly)
+        loop="$(sudo cryptsetup status "$mapper" 2>/dev/null | grep 'device:' | awk '{print $2}' || true)"
+    fi
+    if [[ -n "$loop" ]] && [[ -e "$loop" ]]; then
+        info "Detaching ${loop}"
+        sudo losetup -d "$loop"
+    fi
+
+    info "Closed: ${container}"
+}
+
+cmd_status() {
+    local container="${1:-}"
+
+    if [[ -n "$container" ]]; then
+        container="$(resolve_path "$container")"
+        [[ -f "$container" ]] || die "container not found: ${container}"
+
+        local mapper
+        mapper="$(mapper_name_from_path "$container")"
+        local loop
+        loop="$(find_loop_for_file "$container")"
+
+        echo "Container : ${container}"
+        echo "Mapper    : ${mapper}"
+
+        if mapper_is_active "$mapper"; then
+            echo "Status    : open"
+            local mnt
+            mnt="$(findmnt -n -o TARGET "/dev/mapper/${mapper}" 2>/dev/null || true)"
+            echo "Loop      : ${loop:-unknown}"
+            echo "Mount     : ${mnt:-not mounted}"
+            sudo cryptsetup status "$mapper" 2>/dev/null | sed 's/^/  /'
+        else
+            echo "Status    : closed"
+            echo "Loop      : ${loop:-none}"
+        fi
+        return
+    fi
+
+    # Show all active nanoluks mappers
+    local found=false
+    for dm in /dev/mapper/"${MAPPER_PREFIX}"-*; do
+        [[ -e "$dm" ]] || continue
+        found=true
+        local name="${dm##*/}"
+        local mnt
+        mnt="$(findmnt -n -o TARGET "$dm" 2>/dev/null || true)"
+        printf "%-30s  mounted: %s\n" "$name" "${mnt:-no}"
+    done
+
+    if ! $found; then
+        echo "No active ${PROG} containers."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+check_deps
+
+case "${1:-}" in
+    create) shift; cmd_create "$@" ;;
+    open)   shift; cmd_open "$@" ;;
+    close)  shift; cmd_close "$@" ;;
+    status) shift; cmd_status "$@" ;;
+    -h|--help|help) usage ;;
+    --version) echo "${PROG} ${VERSION}" ;;
+    "") usage; exit 1 ;;
+    *) die "unknown command: $1 (try '${PROG} --help')" ;;
+esac
