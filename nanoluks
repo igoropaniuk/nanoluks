@@ -61,6 +61,19 @@ check_deps() {
     need_cmd bc
 }
 
+# Cleanup state for trap handler
+_cleanup_mapper=""
+_cleanup_loop=""
+_cleanup_container=""
+
+# Cleanup on failure: close mapper, detach loop, optionally remove container
+cleanup_on_failure() {
+    [[ -n "$_cleanup_mapper" ]] && mapper_is_active "$_cleanup_mapper" \
+        && sudo cryptsetup close "$_cleanup_mapper" 2>/dev/null
+    [[ -n "$_cleanup_loop" ]] && sudo losetup -d "$_cleanup_loop" 2>/dev/null
+    [[ -n "$_cleanup_container" ]] && rm -f "$_cleanup_container"
+}
+
 # Derive a mapper name from a container path: /foo/bar/vault.img -> nanoluks-vault
 mapper_name_from_path() {
     local base
@@ -198,6 +211,11 @@ cmd_create() {
     loop="$(sudo losetup -fP --show "$container")"
     info "Loop device: ${loop}"
 
+    _cleanup_mapper="$mapper"
+    _cleanup_loop="$loop"
+    _cleanup_container="$container"
+    trap cleanup_on_failure EXIT
+
     info "Formatting as LUKS"
     local passphrase
     passphrase="$(read_new_passphrase)"
@@ -212,6 +230,9 @@ cmd_create() {
     info "Closing device"
     sudo cryptsetup close "$mapper"
     sudo losetup -d "$loop"
+
+    # Success - disable cleanup trap
+    trap - EXIT
 
     info "Done. Container ready: ${container}"
     info "Run '${PROG} open ${container}' to mount it."
@@ -245,6 +266,11 @@ cmd_open() {
     loop="$(sudo losetup -fP --show "$container")"
     info "Loop device: ${loop}"
 
+    _cleanup_mapper="$mapper"
+    _cleanup_loop="$loop"
+    _cleanup_container=""
+    trap cleanup_on_failure EXIT
+
     info "Opening ${container}"
     local passphrase
     read_passphrase "Enter passphrase: " passphrase
@@ -253,6 +279,9 @@ cmd_open() {
     info "Mounting at ${mountpoint}"
     sudo mkdir -p "$mountpoint"
     sudo mount "/dev/mapper/${mapper}" "$mountpoint"
+
+    # Success - disable cleanup trap
+    trap - EXIT
 
     info "Mounted: ${mountpoint}"
 }
