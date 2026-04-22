@@ -140,6 +140,7 @@ Usage:
   ${PROG} create <path> [options]    Create a new encrypted container
   ${PROG} open   <path> [options]    Open and mount an existing container
   ${PROG} close  <path|mount|name>   Unmount, close, and detach a container
+  ${PROG} close-all                  Close all active containers
   ${PROG} status [path]              Show status of containers
 
 Create options:
@@ -153,6 +154,7 @@ Examples:
   ${PROG} create vault.img --size 4G --fs btrfs
   ${PROG} open vault.img
   ${PROG} close vault.img
+  ${PROG} close-all
   ${PROG} status
 EOF
 }
@@ -313,7 +315,7 @@ cmd_close() {
             local loop
             loop="$(sudo cryptsetup status "$mapper" 2>/dev/null | grep 'device:' | awk '{print $2}' || true)"
             if [[ -n "$loop" ]]; then
-                container="$(losetup -O BACK-FILE -n "$loop" 2>/dev/null | xargs || true)"
+                container="$(losetup --raw -O BACK-FILE -n "$loop" 2>/dev/null || true)"
             fi
         else
             die "no active mapper found for: ${target}"
@@ -341,22 +343,40 @@ cmd_close() {
         local loop
         loop="$(sudo cryptsetup status "$mapper" 2>/dev/null | grep 'device:' | awk '{print $2}' || true)"
         if [[ -n "$loop" ]]; then
-            container="$(losetup -O BACK-FILE -n "$loop" 2>/dev/null || true)"
+            container="$(losetup --raw -O BACK-FILE -n "$loop" 2>/dev/null || true)"
         fi
     else
         die "not found: ${target} (expected a container file, mount point, or mapper name)"
     fi
 
+    close_mapper "$mapper" "$container"
+}
+
+# Tear down a fully-qualified mapper: unmount, cryptsetup close, detach loop.
+# Caller is responsible for resolving the mapper name; no name heuristics here.
+close_mapper() {
+    local mapper="$1"
+    local container="${2:-}"
+
     if ! mapper_is_active "$mapper"; then
         die "not open: ${mapper}"
     fi
 
-    # Find mount point and unmount
+    # Capture loop device before close, while cryptsetup status still knows it
+    local loop=""
+    loop="$(sudo cryptsetup status "$mapper" 2>/dev/null | grep 'device:' | awk '{print $2}' || true)"
+    if [[ -z "$container" ]] && [[ -n "$loop" ]]; then
+        container="$(losetup --raw -O BACK-FILE -n "$loop" 2>/dev/null || true)"
+    fi
+
+    # Bash suppresses `set -e` inside subshells used in conditional contexts
+    # (`if !`, `||`, etc.), so failures must be checked explicitly here - otherwise
+    # close-all could miss e.g. a busy umount and proceed to cryptsetup close.
     local mnt
     mnt="$(findmnt -n -o TARGET "/dev/mapper/${mapper}" 2>/dev/null || true)"
     if [[ -n "$mnt" ]]; then
         info "Unmounting ${mnt}"
-        sudo umount "$mnt"
+        sudo umount "$mnt" || die "umount failed: ${mnt}"
         # Remove mount directory if it's under our mount base and empty
         if [[ "$mnt" == "${MOUNT_BASE}/"* ]] && [[ -d "$mnt" ]]; then
             sudo rmdir "$mnt" 2>/dev/null || true
@@ -364,23 +384,35 @@ cmd_close() {
     fi
 
     info "Closing LUKS device ${mapper}"
-    sudo cryptsetup close "$mapper"
+    sudo cryptsetup close "$mapper" || die "cryptsetup close failed: ${mapper}"
 
-    # Detach loop device
-    local loop=""
-    if [[ -n "$container" ]]; then
-        loop="$(find_loop_for_file "$container")"
-    fi
-    if [[ -z "$loop" ]]; then
-        # Fallback: get loop from cryptsetup status (already closed, so check losetup directly)
-        loop="$(sudo cryptsetup status "$mapper" 2>/dev/null | grep 'device:' | awk '{print $2}' || true)"
-    fi
     if [[ -n "$loop" ]] && [[ -e "$loop" ]]; then
         info "Detaching ${loop}"
-        sudo losetup -d "$loop"
+        sudo losetup -d "$loop" || warn "failed to detach ${loop}"
     fi
 
-    info "Closed: ${container}"
+    info "Closed: ${container:-${mapper}}"
+}
+
+cmd_close_all() {
+    [[ $# -eq 0 ]] || die "usage: ${PROG} close-all"
+
+    local found=false exit_code=0
+    for dm in /dev/mapper/"${MAPPER_PREFIX}"-*; do
+        [[ -e "$dm" ]] || continue
+        found=true
+        local mapper="${dm##*/}"
+        # Run in a subshell so a die() in close_mapper doesn't abort the loop
+        if ! ( close_mapper "$mapper" ); then
+            warn "failed to close ${mapper}"
+            exit_code=1
+        fi
+    done
+
+    if ! $found; then
+        info "No active ${PROG} containers."
+    fi
+    return $exit_code
 }
 
 cmd_status() {
@@ -438,6 +470,7 @@ case "${1:-}" in
     create) shift; cmd_create "$@" ;;
     open)   shift; cmd_open "$@" ;;
     close)  shift; cmd_close "$@" ;;
+    close-all) shift; cmd_close_all "$@" ;;
     status) shift; cmd_status "$@" ;;
     -h|--help|help) usage ;;
     --version) echo "${PROG} ${VERSION}" ;;

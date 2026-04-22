@@ -19,6 +19,7 @@ command while using only standard Linux utilities under the hood.
 nanoluks create <path> [options]    Create a new encrypted container
 nanoluks open   <path> [options]    Open and mount an existing container
 nanoluks close  <path|mount|name>   Unmount, close, and detach a container
+nanoluks close-all                  Close all active containers
 nanoluks status [path]              Show status of containers
 ```
 
@@ -71,6 +72,12 @@ nanoluks close vault                 # by mapper name
 ```
 
 Unmounts the filesystem, closes the LUKS device, and detaches the loop device.
+
+To close every active container in one go:
+
+```bash
+nanoluks close-all
+```
 
 ### Check status
 
