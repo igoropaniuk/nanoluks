@@ -8,70 +8,28 @@ on:
 
 jobs:
   lint:
-    name: ShellCheck
+    name: make lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Install ShellCheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
-      - name: Run ShellCheck
-        run: shellcheck nanoluks
 
-  ascii-check:
-    name: ASCII check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Check for non-ASCII characters
-        run: |
-          if grep -rPn '[^\x00-\x7F]' nanoluks README.md; then
-            echo "::error::Non-ASCII characters found"
-            exit 1
-          fi
+      - name: Run lint
+        run: make lint
 
-  integration:
-    name: Integration test
+  test:
+    name: make test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cryptsetup bc
+        run: sudo apt-get update && sudo apt-get install -y cryptsetup bc
 
       - name: Load dm-crypt module
         run: sudo modprobe dm-crypt
 
-      - name: Create 50MB container
-        run: |
-          printf 'testpassword\ntestpassword\n' | ./nanoluks create /tmp/test-vault.img --size 50M --fs ext4
-
-      - name: Open and mount
-        run: |
-          printf 'testpassword\n' | ./nanoluks open /tmp/test-vault.img
-
-      - name: Verify mount
-        run: |
-          mountpoint -q /mnt/nanoluks/test-vault
-          echo "Mount verified"
-
-      - name: Write and read test file
-        run: |
-          sudo sh -c 'echo "hello from nanoluks" > /mnt/nanoluks/test-vault/test.txt'
-          grep -q "hello from nanoluks" /mnt/nanoluks/test-vault/test.txt
-          echo "Read/write verified"
-
-      - name: Close container
-        run: ./nanoluks close /tmp/test-vault.img
-
-      - name: Verify closed
-        run: |
-          ! mountpoint -q /mnt/nanoluks/test-vault 2>/dev/null
-          ! [ -e /dev/mapper/nanoluks-test-vault ]
-          echo "Close verified"
-
-      - name: Delete container
-        run: |
-          rm /tmp/test-vault.img
-          echo "Cleanup done"
+      - name: Run integration test
+        run: make test
