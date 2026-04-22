@@ -25,7 +25,7 @@ warn() { echo "${PROG}: warning: $*" >&2; }
 # Read a passphrase from the terminal (no echo), fall back to stdin
 read_passphrase() {
     local prompt="${1:-Enter passphrase: }" var="$2"
-    if [[ -r /dev/tty ]] && : </dev/tty 2>/dev/null; then
+    if [[ -r /dev/tty ]] && : 2>/dev/null </dev/tty; then
         read -rsp "$prompt" "${var?}" </dev/tty
         echo >&2  # newline after hidden input
     else
