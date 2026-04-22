@@ -109,6 +109,41 @@ Installs to `/usr/local/bin`. To uninstall:
 sudo make uninstall
 ```
 
+## Development
+
+Two additional Makefile targets cover static analysis and an
+end-to-end sanity check. Both are wired into CI and can be run
+locally.
+
+### Lint
+
+```bash
+make lint
+```
+
+Runs `shellcheck` against `nanoluks` and greps `nanoluks` and
+`README.md` for non-ASCII bytes (the repo is kept strictly ASCII so
+diffs stay portable across terminals and editors). Requires
+`shellcheck` to be installed.
+
+### Test
+
+```bash
+make test
+```
+
+Exercises the full `create` -> `open` -> write -> `close` lifecycle
+against a 50M ext4 container at `/tmp/make-test-fixture.img`, mounted
+under `/mnt/nanoluks/make-test-fixture` (names chosen to be
+unambiguously internal so a `make test` run never touches a real
+user vault). The recipe needs root because it mounts a real
+filesystem, so it self-elevates with `sudo` if not already running
+as root. It also relies on `setsid` from `util-linux` (normally
+preinstalled) to feed the passphrase on stdin without a controlling
+terminal. Cleans up any leftover mount, mapper, and image from a
+previous run before starting, and fails if the mapper or mount
+point is still present after `close`.
+
 ## License
 
 MIT
